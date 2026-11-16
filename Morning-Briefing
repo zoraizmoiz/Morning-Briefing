@@ -1,0 +1,118 @@
+import json                      # read the private config file
+import os                        # expand ~ to your home folder
+import subprocess                # run osascript (AppleScript)
+import sys                       # exit cleanly on config errors
+import time                      # pause between retries
+from datetime import datetime    # current date/time for the header
+
+import requests                  # HTTP calls to Alpaca
+
+# ─── CONFIG (loaded from a private file, never hardcoded) ─────────────────
+CONFIG_PATH = os.path.expanduser("~/.briefing_config.json")  # keys and phone live here, not in the script
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:                          # open the config file
+            return json.load(f)                               # returns {"key":..., "secret":..., "phone":...}
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Config problem: {e}. Expected a JSON file at {CONFIG_PATH}")  # shows in terminal and cron log
+        sys.exit(1)                                           # stop, nothing can work without keys
+
+CONFIG = load_config()                                        # load once at startup
+PHONE = CONFIG["phone"]                                       # number to message, e.g. "+447..."
+
+TICKERS = [                                                   # stocks to include (VUAA and RHM are not on Alpaca's US feed)
+    "NVDA", "TSM", "SHEL", "AMD", "GOOGL",
+    "LMT", "AVGO", "PLTR", "BLK", "MSFT", "AAPL",
+]
+
+BASE_URL = "https://data.alpaca.markets/v2"                   # Alpaca market data API
+HEADERS = {
+    "APCA-API-KEY-ID": CONFIG["key"],                         # API key header
+    "APCA-API-SECRET-KEY": CONFIG["secret"],                  # API secret header
+}
+
+# ─── FETCH DATA ───────────────────────────────────────────────────────────
+def fetch_snapshots(symbols):
+    for attempt in range(3):                                  # try up to 3 times
+        try:
+            res = requests.get(
+                f"{BASE_URL}/stocks/snapshots",               # snapshot = latest trade + daily bars per ticker
+                headers=HEADERS,
+                params={"symbols": symbols},
+                timeout=15,                                   # never hang forever
+            )
+            res.raise_for_status()                            # raises on 401/403/429/5xx
+            return res.json()                                 # dict keyed by ticker
+        except requests.RequestException as e:
+            print(f"Attempt {attempt + 1} failed: {e}")       # visible in /tmp/morning_briefing.log
+            time.sleep(5)                                     # wait before retrying
+    raise RuntimeError("Alpaca unreachable after 3 attempts") # caught in main and sent as a message
+
+def get_stock_data(tickers):
+    data = fetch_snapshots(",".join(tickers))                 # one API call for all tickers
+    results = []                                              # processed output
+    for ticker in tickers:                                    # one entry per ticker
+        try:
+            snap = data[ticker]                               # this ticker's snapshot
+            trade = snap["latestTrade"]                       # most recent trade
+            price = trade["p"]                                # current price
+            daily = snap.get("dailyBar") or {}                # latest session bar
+            prev = snap.get("prevDailyBar") or {}             # session before that
+            if daily and daily["t"][:10] != trade["t"][:10]:  # latest trade is newer than the last full session (e.g. pre-market)
+                ref_close = daily["c"]                        # compare against the last session's close
+            else:
+                ref_close = prev["c"]                         # otherwise compare against the previous session's close
+            pct = (price - ref_close) / ref_close * 100       # percentage change
+            results.append({"ticker": ticker, "price": price, "pct": pct})  # store result
+        except Exception as e:
+            print(f"Error for {ticker}: {e!r}")               # log which ticker failed and why
+            results.append({"ticker": ticker, "price": None}) # mark as unavailable
+    return results
+
+# ─── FORMAT MESSAGE ───────────────────────────────────────────────────────
+def format_briefing(stocks):
+    now = datetime.now()                                      # current local time
+    lines = [
+        "📊 Morning Briefing",                                # title
+        now.strftime("%A, %d %B %Y · %H:%M"),                 # e.g. "Monday, 13 April 2026 · 08:00"
+        "─────────────────────",                              # separator
+    ]
+    for s in stocks:                                          # one line per stock
+        if s["price"] is None:
+            lines.append(f"⚪ {s['ticker']:<6} unavailable")   # no data for this ticker
+        else:
+            up = s["pct"] >= 0                                # direction of the move
+            emoji = "🟢" if up else "🔴"                      # colour dot
+            arrow = "▲" if up else "▼"                        # arrow
+            lines.append(f"{emoji} {s['ticker']:<6} ${s['price']:>8.2f}  {arrow} {s['pct']:+.2f}%")  # :+ adds the sign automatically
+    lines.append("─────────────────────")                      # footer separator
+    lines.append("Have a great trading day. 🚀")               # footer
+    return "\n".join(lines)                                   # join into one message
+
+# ─── SEND iMESSAGE ────────────────────────────────────────────────────────
+APPLESCRIPT = '''on run argv
+    set theNumber to item 1 of argv
+    set theMessage to item 2 of argv
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        set targetBuddy to buddy theNumber of targetService
+        send theMessage to targetBuddy
+    end tell
+end run'''
+
+def send_imessage(phone_number, message):
+    subprocess.run(["osascript", "-e", APPLESCRIPT, phone_number, message], check=True)  # message passed as an argument, so no escaping needed
+    print("✅ iMessage sent successfully.")                    # confirmation
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("Fetching stock data...")                           # status
+    try:
+        message = format_briefing(get_stock_data(TICKERS))    # build the briefing
+    except Exception as e:
+        message = f"⚠️ Briefing failed: {e}"                  # you get told if something breaks
+    print("\n--- PREVIEW ---")
+    print(message)                                            # show it in the terminal
+    print("---------------\n")
+    send_imessage(PHONE, message)                             # send it
